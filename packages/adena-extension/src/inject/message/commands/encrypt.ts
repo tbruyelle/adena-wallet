@@ -2,30 +2,60 @@ import { MemoryProvider } from '@common/provider/memory/memory-provider';
 
 const MEMORY_KEY = 'encryptKey';
 
+// Session-storage copy of the in-memory key, exported as a JWK.
+//
+// The key only ever lived in the background's MemoryProvider, which is a plain
+// Map created when the service worker starts. Chrome (and Firefox's event
+// page) restart that worker whenever they like — after a sleep/resume, under
+// memory pressure, on an extension reload. Every restart emptied the map, and
+// the next `getInMemoryKey` minted a brand-new key. The password in
+// chrome.storage.session was encrypted with the old one, so decrypting it
+// threw OperationError, `isLocked()` reported true, and the popup showed the
+// login screen long before the auto-lock alarm was due.
+//
+// chrome.storage.session has the lifetime we actually want: memory-only,
+// cleared on browser restart and by the auto-lock alarm, but it survives a
+// worker restart. Keeping the key there next to the ciphertext does not widen
+// who can decrypt — any context able to read session storage can already ask
+// the background to decrypt on its behalf.
+const SESSION_KEY = 'ENCRYPT_KEY_JWK';
+
 const KEY_LENGTH = 256; // AES-256 key length
 const IV_LENGTH = 12; // GCM nonce length (12 bytes is recommended)
 
+const AES_GCM_ALGORITHM: AesKeyGenParams = { name: 'AES-GCM', length: KEY_LENGTH };
+const KEY_USAGES: KeyUsage[] = ['encrypt', 'decrypt'];
+
+// Collapses concurrent cold-start calls into one restore-or-generate, so two
+// requests arriving right after a worker restart cannot each mint a key and
+// leave the caller holding one that was never persisted.
+let pendingKey: Promise<CryptoKey | null> | null = null;
+
 export async function getInMemoryKey(memoryProvider: MemoryProvider): Promise<CryptoKey | null> {
-  try {
-    const key = memoryProvider?.get(MEMORY_KEY) || null;
-    if (!key) {
-      const generated = await generateInMemoryKey();
-
-      memoryProvider.set(MEMORY_KEY, generated);
-    }
-
-    return memoryProvider.get(MEMORY_KEY) || null;
-  } catch (e) {
-    console.error(e);
+  const cached = memoryProvider?.get<CryptoKey>(MEMORY_KEY) || null;
+  if (cached) {
+    return cached;
   }
 
-  return null;
+  if (!pendingKey) {
+    pendingKey = restoreOrGenerateKey(memoryProvider).finally(() => {
+      pendingKey = null;
+    });
+  }
+
+  return pendingKey;
 }
 
 export async function clearInMemoryKey(memoryProvider: MemoryProvider): Promise<void> {
   const random = await generateInMemoryKey();
   memoryProvider.set(MEMORY_KEY, random);
   memoryProvider.set(MEMORY_KEY, null);
+
+  try {
+    await chrome.storage.session.remove(SESSION_KEY);
+  } catch (e) {
+    console.warn('Failed to remove the session copy of the encrypt key', e);
+  }
 }
 
 // Encrypts a password using AES-GCM
@@ -76,13 +106,59 @@ export const decryptPassword = async (
   return dec.decode(decrypted);
 };
 
+async function restoreOrGenerateKey(memoryProvider: MemoryProvider): Promise<CryptoKey | null> {
+  try {
+    let key = await restoreSessionKey();
+    if (!key) {
+      key = await generateInMemoryKey();
+      await persistSessionKey(key);
+    }
+
+    memoryProvider.set(MEMORY_KEY, key);
+
+    return memoryProvider.get<CryptoKey>(MEMORY_KEY) || null;
+  } catch (e) {
+    console.error(e);
+  }
+
+  return null;
+}
+
+// A missing or unreadable session copy is not an error: it is simply the
+// state before the first unlock, or after a lock. Hand back null and let the
+// caller mint a fresh key.
+async function restoreSessionKey(): Promise<CryptoKey | null> {
+  try {
+    const stored = await chrome.storage.session.get(SESSION_KEY);
+    const jwk = stored?.[SESSION_KEY];
+    if (!jwk || typeof jwk !== 'object') {
+      return null;
+    }
+
+    return await crypto.subtle.importKey(
+      'jwk',
+      jwk as JsonWebKey,
+      AES_GCM_ALGORITHM,
+      true,
+      KEY_USAGES,
+    );
+  } catch (e) {
+    console.warn('Failed to restore the encrypt key from session storage', e);
+    return null;
+  }
+}
+
+// Best effort: if the copy cannot be written, the key still works for this
+// worker lifetime exactly as before — it just will not survive a restart.
+async function persistSessionKey(key: CryptoKey): Promise<void> {
+  try {
+    const jwk = await crypto.subtle.exportKey('jwk', key);
+    await chrome.storage.session.set({ [SESSION_KEY]: jwk });
+  } catch (e) {
+    console.warn('Failed to persist the encrypt key to session storage', e);
+  }
+}
+
 const generateInMemoryKey = async (): Promise<CryptoKey> => {
-  return crypto.subtle.generateKey(
-    {
-      name: 'AES-GCM',
-      length: KEY_LENGTH,
-    },
-    true,
-    ['encrypt', 'decrypt'],
-  );
+  return crypto.subtle.generateKey(AES_GCM_ALGORITHM, true, KEY_USAGES);
 };
